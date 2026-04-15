@@ -75,6 +75,35 @@ KEY_TAKEAWAY: ...`;
   });
 
   if (!response.ok) {
+    // Retry on rate limit (429) up to 3 times with backoff
+    if (response.status === 429) {
+      const retryAfter = 60;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        const wait = retryAfter * attempt;
+        console.log(`    Rate limited. Retrying in ${wait}s (attempt ${attempt}/3)...`);
+        await new Promise((r) => setTimeout(r, wait * 1000));
+        const retry = await fetch(`${GEMINI_API_URL}?key=${apiKey}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { temperature: 0.7, maxOutputTokens: 500 },
+          }),
+        });
+        if (retry.ok) {
+          const retryResult = await retry.json();
+          const retryText =
+            retryResult.candidates?.[0]?.content?.parts?.[0]?.text || "";
+          if (retryText) {
+            return parseGeminiResponse(retryText, paper.title);
+          }
+        }
+        if (retry.status !== 429) break;
+      }
+      // Fallback: return raw abstract summary
+      console.log("    Gemini unavailable, using fallback summary.");
+      return fallbackSummary(paper);
+    }
     const error = await response.text();
     throw new Error(`Gemini API error: ${response.status} - ${error}`);
   }
@@ -83,9 +112,12 @@ KEY_TAKEAWAY: ...`;
   const text =
     result.candidates?.[0]?.content?.parts?.[0]?.text || "Summary unavailable";
 
-  // Parse the structured response
+  return parseGeminiResponse(text, paper.title);
+}
+
+function parseGeminiResponse(text, fallbackTitle) {
   const simpleTitle =
-    text.match(/SIMPLE_TITLE:\s*(.*?)(?:\n|$)/)?.[1]?.trim() || paper.title;
+    text.match(/SIMPLE_TITLE:\s*(.*?)(?:\n|$)/)?.[1]?.trim() || fallbackTitle;
   const whatTheyDid =
     text.match(/WHAT_THEY_DID:\s*([\s\S]*?)(?=WHY_IT_MATTERS:|$)/)?.[1]?.trim() ||
     "Summary unavailable.";
@@ -96,6 +128,17 @@ KEY_TAKEAWAY: ...`;
     text.match(/KEY_TAKEAWAY:\s*([\s\S]*?)$/)?.[1]?.trim() || "";
 
   return { simpleTitle, whatTheyDid, whyItMatters, keyTakeaway };
+}
+
+function fallbackSummary(paper) {
+  // Clean up abstract into a readable summary without Gemini
+  const abstract = paper.abstract.slice(0, 300).replace(/\n/g, " ");
+  return {
+    simpleTitle: paper.title,
+    whatTheyDid: abstract + "...",
+    whyItMatters: "Read the full paper for more details.",
+    keyTakeaway: "A new AI research contribution worth exploring.",
+  };
 }
 
 function buildEmailHtml(papers) {
