@@ -1,10 +1,10 @@
 /**
  * Fetches 4 trending AI papers from HuggingFace Daily Papers,
- * summarizes them in layman terms using Google Gemini,
+ * summarizes them in layman terms using OpenAI GPT-4o-mini,
  * and emails them via Gmail SMTP.
  *
  * Required environment variables:
- *   GEMINI_API_KEY  - Google Gemini API key (from aistudio.google.com)
+ *   OPENAI_API_KEY  - OpenAI API key
  *   GMAIL_USER      - Gmail address to send from
  *   GMAIL_APP_PASS  - Gmail App Password (16-char)
  *   TO_EMAIL        - Comma-separated recipient emails
@@ -13,9 +13,7 @@
 const nodemailer = require("nodemailer");
 
 const HF_DAILY_PAPERS_URL = "https://huggingface.co/api/daily_papers";
-const ARXIV_API_URL = "https://export.arxiv.org/api/query";
-const GEMINI_API_URL =
-  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
+const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
 
 async function fetchDailyPapers() {
   console.log("Fetching HuggingFace daily papers...");
@@ -34,15 +32,17 @@ async function fetchDailyPapers() {
   return sorted.map((p) => ({
     title: p.paper.title,
     abstract: p.paper.summary,
-    authors: (p.paper.authors || []).map((a) => a.name || a.user || "Unknown").slice(0, 5),
+    authors: (p.paper.authors || [])
+      .map((a) => a.name || a.user || "Unknown")
+      .slice(0, 5),
     arxivId: p.paper.id,
     url: `https://arxiv.org/abs/${p.paper.id}`,
     upvotes: p.paper.upvotes || 0,
   }));
 }
 
-async function simplifyWithGemini(paper) {
-  const apiKey = process.env.GEMINI_API_KEY;
+async function simplifyWithOpenAI(paper) {
+  const apiKey = process.env.OPENAI_API_KEY;
 
   const prompt = `You are explaining an AI research paper to someone with no technical background. 
 Read this paper title and abstract, then provide:
@@ -62,68 +62,44 @@ WHAT_THEY_DID: ...
 WHY_IT_MATTERS: ...
 KEY_TAKEAWAY: ...`;
 
-  const response = await fetch(`${GEMINI_API_URL}?key=${apiKey}`, {
+  const response = await fetch(OPENAI_API_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
     body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.7,
-        maxOutputTokens: 500,
-      },
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.7,
+      max_tokens: 500,
     }),
   });
 
   if (!response.ok) {
-    // Retry on rate limit (429) up to 3 times with backoff
-    if (response.status === 429) {
-      const retryAfter = 60;
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        const wait = retryAfter * attempt;
-        console.log(`    Rate limited. Retrying in ${wait}s (attempt ${attempt}/3)...`);
-        await new Promise((r) => setTimeout(r, wait * 1000));
-        const retry = await fetch(`${GEMINI_API_URL}?key=${apiKey}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { temperature: 0.7, maxOutputTokens: 500 },
-          }),
-        });
-        if (retry.ok) {
-          const retryResult = await retry.json();
-          const retryText =
-            retryResult.candidates?.[0]?.content?.parts?.[0]?.text || "";
-          if (retryText) {
-            return parseGeminiResponse(retryText, paper.title);
-          }
-        }
-        if (retry.status !== 429) break;
-      }
-      // Fallback: return raw abstract summary
-      console.log("    Gemini unavailable, using fallback summary.");
-      return fallbackSummary(paper);
-    }
     const error = await response.text();
-    throw new Error(`Gemini API error: ${response.status} - ${error}`);
+    console.log(`    OpenAI error: ${response.status}, using fallback.`);
+    return fallbackSummary(paper);
   }
 
   const result = await response.json();
-  const text =
-    result.candidates?.[0]?.content?.parts?.[0]?.text || "Summary unavailable";
+  const text = result.choices?.[0]?.message?.content || "";
 
-  return parseGeminiResponse(text, paper.title);
+  if (!text) return fallbackSummary(paper);
+  return parseResponse(text, paper.title);
 }
 
-function parseGeminiResponse(text, fallbackTitle) {
+function parseResponse(text, fallbackTitle) {
   const simpleTitle =
     text.match(/SIMPLE_TITLE:\s*(.*?)(?:\n|$)/)?.[1]?.trim() || fallbackTitle;
   const whatTheyDid =
-    text.match(/WHAT_THEY_DID:\s*([\s\S]*?)(?=WHY_IT_MATTERS:|$)/)?.[1]?.trim() ||
-    "Summary unavailable.";
+    text
+      .match(/WHAT_THEY_DID:\s*([\s\S]*?)(?=WHY_IT_MATTERS:|$)/)?.[1]
+      ?.trim() || "Summary unavailable.";
   const whyItMatters =
-    text.match(/WHY_IT_MATTERS:\s*([\s\S]*?)(?=KEY_TAKEAWAY:|$)/)?.[1]?.trim() ||
-    "";
+    text
+      .match(/WHY_IT_MATTERS:\s*([\s\S]*?)(?=KEY_TAKEAWAY:|$)/)?.[1]
+      ?.trim() || "";
   const keyTakeaway =
     text.match(/KEY_TAKEAWAY:\s*([\s\S]*?)$/)?.[1]?.trim() || "";
 
@@ -131,7 +107,6 @@ function parseGeminiResponse(text, fallbackTitle) {
 }
 
 function fallbackSummary(paper) {
-  // Clean up abstract into a readable summary without Gemini
   const abstract = paper.abstract.slice(0, 300).replace(/\n/g, " ");
   return {
     simpleTitle: paper.title,
@@ -203,7 +178,7 @@ function buildEmailHtml(papers) {
   ${paperCards}
   <div style="text-align: center; font-size: 12px; color: #999; margin-top: 30px; padding-top: 16px; border-top: 1px solid #eee;">
     <p>Papers sourced from <a href="https://huggingface.co/papers" style="color: #7c3aed;">HuggingFace Daily Papers</a> (ranked by community upvotes)</p>
-    <p>Summaries generated by Gemini AI for easy reading</p>
+    <p>Summaries simplified by AI for easy reading</p>
   </div>
 </body>
 </html>`;
@@ -243,12 +218,10 @@ async function main() {
   console.log(`Found ${papers.length} papers:`);
   papers.forEach((p) => console.log(`  - "${p.title}" (${p.upvotes} upvotes)`));
 
-  console.log("\nSimplifying with Gemini...");
+  console.log("\nSimplifying with OpenAI...");
   for (const paper of papers) {
     console.log(`  Summarizing: ${paper.title.slice(0, 60)}...`);
-    paper.summary = await simplifyWithGemini(paper);
-    // Small delay to avoid rate limits
-    await new Promise((r) => setTimeout(r, 1000));
+    paper.summary = await simplifyWithOpenAI(paper);
   }
 
   console.log("\nBuilding email...");
